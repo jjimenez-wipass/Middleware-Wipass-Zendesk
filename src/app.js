@@ -82,4 +82,7 @@ function createApp(options = {}) {
   };
 }
 
-module.exports = { createApp };
+const { app } = createApp();
+
+module.exports = app;
+module.exports.createApp = createApp;
