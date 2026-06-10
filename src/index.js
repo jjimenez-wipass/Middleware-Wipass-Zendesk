@@ -1,9 +1,5 @@
-require("dotenv").config();
-
 const { createApp } = require("./app");
 
-const { app, env, logger } = createApp();
+const { app } = createApp();
 
-app.listen(env.port, () => {
-  logger.info({ port: env.port }, "Middleware running");
-});
+module.exports = app;
