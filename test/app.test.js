@@ -93,8 +93,27 @@ test("POST /webhooks/hubspot ignores non-configured onboarding stages", async (t
   const harness = await createHarness(t);
   const response = await postHubSpotWebhook(harness.appUrl, DEFAULT_ENV.HUBSPOT_WEBHOOK_SECRET, [
     {
-      objectId: "123",
+      objectId: "deal-1",
+      propertyName: "dealstage",
       propertyValue: "stage-other"
+    }
+  ]);
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    status: "ignored",
+    requestId: response.headers.get("x-request-id")
+  });
+  assert.equal(harness.platform.state.tickets.length, 0);
+});
+
+test("POST /webhooks/hubspot ignores matching stages outside the configured onboarding pipeline", async (t) => {
+  const harness = await createHarness(t);
+  const response = await postHubSpotWebhook(harness.appUrl, DEFAULT_ENV.HUBSPOT_WEBHOOK_SECRET, [
+    {
+      objectId: "deal-outside-pipeline",
+      propertyName: "dealstage",
+      propertyValue: DEFAULT_ENV.HUBSPOT_STAGE_ID_START
     }
   ]);
 
@@ -111,7 +130,8 @@ test("POST /webhooks/hubspot creates and updates a single onboarding ticket acro
 
   const started = await postHubSpotWebhook(harness.appUrl, DEFAULT_ENV.HUBSPOT_WEBHOOK_SECRET, [
     {
-      objectId: "123",
+      objectId: "deal-1",
+      propertyName: "dealstage",
       propertyValue: DEFAULT_ENV.HUBSPOT_STAGE_ID_START
     }
   ]);
@@ -124,7 +144,8 @@ test("POST /webhooks/hubspot creates and updates a single onboarding ticket acro
 
   const blocked = await postHubSpotWebhook(harness.appUrl, DEFAULT_ENV.HUBSPOT_WEBHOOK_SECRET, [
     {
-      objectId: "123",
+      objectId: "deal-1",
+      propertyName: "dealstage",
       propertyValue: DEFAULT_ENV.HUBSPOT_STAGE_ID_BLOCKED
     }
   ]);
@@ -134,7 +155,8 @@ test("POST /webhooks/hubspot creates and updates a single onboarding ticket acro
 
   const completed = await postHubSpotWebhook(harness.appUrl, DEFAULT_ENV.HUBSPOT_WEBHOOK_SECRET, [
     {
-      objectId: "123",
+      objectId: "deal-1",
+      propertyName: "dealstage",
       propertyValue: DEFAULT_ENV.HUBSPOT_STAGE_ID_COMPLETED
     }
   ]);
@@ -160,7 +182,8 @@ test("POST /webhooks/hubspot responds 200 after exhausting Zendesk retries", asy
 
   const response = await postHubSpotWebhook(harness.appUrl, DEFAULT_ENV.HUBSPOT_WEBHOOK_SECRET, [
     {
-      objectId: "123",
+      objectId: "deal-1",
+      propertyName: "dealstage",
       propertyValue: DEFAULT_ENV.HUBSPOT_STAGE_ID_START
     }
   ]);
@@ -202,11 +225,45 @@ async function createPlatformMock() {
   const state = {
     contacts: new Map([
       [
-        "123",
+        "contact-1",
         {
           email: "ana@wipass.test",
           firstname: "Ana",
           lastname: "Cliente"
+        }
+      ]
+    ]),
+    deals: new Map([
+      [
+        "deal-1",
+        {
+          id: "deal-1",
+          properties: {
+            dealname: "Hotel Roma onboarding",
+            dealstage: DEFAULT_ENV.HUBSPOT_STAGE_ID_START,
+            pipeline: DEFAULT_ENV.HUBSPOT_ONBOARDING_PIPELINE_ID
+          },
+          associations: {
+            contacts: {
+              results: [{ id: "contact-1" }]
+            }
+          }
+        }
+      ],
+      [
+        "deal-outside-pipeline",
+        {
+          id: "deal-outside-pipeline",
+          properties: {
+            dealname: "Legacy onboarding",
+            dealstage: DEFAULT_ENV.HUBSPOT_STAGE_ID_START,
+            pipeline: "pipeline-other"
+          },
+          associations: {
+            contacts: {
+              results: [{ id: "contact-1" }]
+            }
+          }
         }
       ]
     ]),
@@ -227,6 +284,43 @@ async function createPlatformMock() {
     if (configuredFailure && configuredFailure.remaining > 0) {
       configuredFailure.remaining -= 1;
       writeJson(res, configuredFailure.status, { error: "mock failure" });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/crm/v3/objects/deals/")) {
+      const dealId = url.pathname.split("/").pop();
+      const deal = state.deals.get(dealId);
+
+      if (!deal) {
+        writeJson(res, 404, { message: "Not found" });
+        return;
+      }
+
+      writeJson(res, 200, deal);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/crm/v4/objects/deals/") && url.pathname.endsWith("/associations/contacts")) {
+      const dealId = url.pathname.split("/")[5];
+      const deal = state.deals.get(dealId);
+
+      if (!deal) {
+        writeJson(res, 404, { message: "Not found" });
+        return;
+      }
+
+      const contactResults = (deal.associations?.contacts?.results || []).map((contact, index) => ({
+        toObjectId: contact.id,
+        associationTypes: [
+          {
+            category: "HUBSPOT_DEFINED",
+            typeId: index === 0 ? 1 : 279,
+            label: index === 0 ? "Primary" : null
+          }
+        ]
+      }));
+
+      writeJson(res, 200, { results: contactResults });
       return;
     }
 

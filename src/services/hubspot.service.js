@@ -9,45 +9,26 @@ class HubSpotService {
   }
 
   async normalizeWebhook({ body, requestId, receivedAt }) {
-    const sourceEvent = this.pickRelevantEvent(body);
+    const sourceEvents = this.extractSourceEvents(body);
 
-    if (!sourceEvent) {
-      return null;
-    }
+    for (const sourceEvent of sourceEvents) {
+      const normalizedEvent = await this.normalizeSourceEvent({
+        sourceEvent,
+        requestId,
+        receivedAt
+      });
 
-    const stageId = this.extractStageId(sourceEvent);
-    const stageType = this.resolveStageType(stageId);
-
-    if (!stageId || !stageType) {
-      return null;
-    }
-
-    const contact = await this.resolveContact(sourceEvent);
-
-    if (!contact.email) {
-      throw new AppError(400, "HubSpot onboarding event is missing the contact email");
-    }
-
-    return {
-      eventType: "hubspot.onboarding.stage_changed",
-      source: "hubspot",
-      requestId,
-      timestamp: receivedAt,
-      payload: {
-        contactEmail: contact.email,
-        contactName: contact.name,
-        pipelineId: this.extractPipelineId(sourceEvent),
-        stageId,
-        stageType,
-        hubspotObjectId: this.extractObjectId(sourceEvent)
+      if (normalizedEvent) {
+        return normalizedEvent;
       }
-    };
+    }
+
+    return null;
   }
 
-  pickRelevantEvent(body) {
+  extractSourceEvents(body) {
     if (Array.isArray(body)) {
-      const matchingEvent = body.find((candidate) => this.resolveStageType(this.extractStageId(candidate)));
-      return matchingEvent || null;
+      return body;
     }
 
     if (body && typeof body === "object") {
@@ -61,15 +42,51 @@ class HubSpotService {
           throw new AppError(400, "HubSpot onboarding payload is missing required fields");
         }
 
-        return body;
+        return [body];
       }
 
       if ("objectId" in body || "propertyValue" in body || "stageId" in body) {
-        return body;
+        return [body];
       }
     }
 
     throw new AppError(400, "HubSpot webhook payload format is not supported");
+  }
+
+  async normalizeSourceEvent({ sourceEvent, requestId, receivedAt }) {
+    const stageId = this.extractStageId(sourceEvent);
+    const stageType = this.resolveStageType(stageId);
+
+    if (!stageId || !stageType) {
+      return null;
+    }
+
+    const eventContext = await this.resolveEventContext(sourceEvent);
+
+    if (!eventContext) {
+      return null;
+    }
+
+    const contact = await this.resolveContact(sourceEvent, eventContext);
+
+    if (!contact.email) {
+      throw new AppError(400, "HubSpot onboarding event is missing the contact email");
+    }
+
+    return {
+      eventType: "hubspot.onboarding.stage_changed",
+      source: "hubspot",
+      requestId,
+      timestamp: receivedAt,
+      payload: {
+        contactEmail: contact.email,
+        contactName: contact.name,
+        pipelineId: eventContext.pipelineId,
+        stageId,
+        stageType,
+        hubspotObjectId: eventContext.hubspotObjectId
+      }
+    };
   }
 
   extractStageId(sourceEvent) {
@@ -128,7 +145,54 @@ class HubSpotService {
     return "";
   }
 
-  async resolveContact(sourceEvent) {
+  async resolveEventContext(sourceEvent) {
+    const payload = sourceEvent.payload || sourceEvent;
+    const explicitPipelineId = this.extractPipelineId(sourceEvent);
+    const hubspotObjectId = this.extractObjectId(sourceEvent);
+    const isDirectPayload = Boolean(payload.contactEmail || payload.email);
+    const isDealStageChangeEvent = this.isDealStageChangeEvent(sourceEvent);
+
+    if (isDirectPayload && !isDealStageChangeEvent) {
+      return {
+        pipelineId: explicitPipelineId,
+        hubspotObjectId
+      };
+    }
+
+    if (!hubspotObjectId) {
+      return {
+        pipelineId: explicitPipelineId,
+        hubspotObjectId: ""
+      };
+    }
+
+    const deal = await this.fetchDeal(hubspotObjectId);
+    const pipelineId = String(deal.properties?.pipeline || explicitPipelineId || "");
+
+    if (!pipelineId) {
+      throw new AppError(400, "HubSpot deal event is missing the pipeline identifier");
+    }
+
+    if (this.env.hubspotOnboardingPipelineId && pipelineId !== this.env.hubspotOnboardingPipelineId) {
+      return null;
+    }
+
+    const contactIds = this.extractAssociatedContactIds(deal);
+    const primaryContactId = await this.resolvePrimaryContactIdForDeal(hubspotObjectId, contactIds);
+
+    return {
+      pipelineId,
+      hubspotObjectId: String(deal.id || hubspotObjectId),
+      primaryContactId
+    };
+  }
+
+  isDealStageChangeEvent(sourceEvent) {
+    const payload = sourceEvent?.payload || sourceEvent;
+    return payload?.propertyName === "dealstage";
+  }
+
+  async resolveContact(sourceEvent, eventContext = {}) {
     const payload = sourceEvent.payload || sourceEvent;
     const directEmail = payload.contactEmail || payload.email;
 
@@ -139,7 +203,7 @@ class HubSpotService {
       };
     }
 
-    const objectId = this.extractObjectId(sourceEvent);
+    const objectId = eventContext.primaryContactId || this.extractObjectId(sourceEvent);
 
     if (!objectId) {
       throw new AppError(400, "HubSpot onboarding event is missing the contact identifier");
@@ -152,19 +216,7 @@ class HubSpotService {
       );
     }
 
-    const contact = await requestJson({
-      fetchImpl: this.fetchImpl,
-      logger: this.logger,
-      retryDelaysMs: this.env.retryDelaysMs,
-      url: `${this.env.hubspotApiBaseUrl}/crm/v3/objects/contacts/${encodeURIComponent(objectId)}?properties=email,firstname,lastname`,
-      headers: {
-        Authorization: `Bearer ${this.env.hubspotAccessToken}`
-      },
-      operationName: "hubspot.get_contact",
-      context: {
-        objectId
-      }
-    });
+    const contact = await this.fetchContact(objectId);
 
     const properties = contact.properties || {};
     const email = properties.email ? String(properties.email).trim() : "";
@@ -177,6 +229,88 @@ class HubSpotService {
         email
       })
     };
+  }
+
+  async fetchDeal(objectId) {
+    return requestJson({
+      fetchImpl: this.fetchImpl,
+      logger: this.logger,
+      retryDelaysMs: this.env.retryDelaysMs,
+      url:
+        `${this.env.hubspotApiBaseUrl}/crm/v3/objects/deals/${encodeURIComponent(objectId)}` +
+        "?properties=dealname,dealstage,pipeline&associations=contacts",
+      headers: {
+        Authorization: `Bearer ${this.env.hubspotAccessToken}`
+      },
+      operationName: "hubspot.get_deal",
+      context: {
+        objectId
+      }
+    });
+  }
+
+  async fetchContact(objectId) {
+    return requestJson({
+      fetchImpl: this.fetchImpl,
+      logger: this.logger,
+      retryDelaysMs: this.env.retryDelaysMs,
+      url:
+        `${this.env.hubspotApiBaseUrl}/crm/v3/objects/contacts/${encodeURIComponent(objectId)}` +
+        "?properties=email,firstname,lastname",
+      headers: {
+        Authorization: `Bearer ${this.env.hubspotAccessToken}`
+      },
+      operationName: "hubspot.get_contact",
+      context: {
+        objectId
+      }
+    });
+  }
+
+  extractAssociatedContactIds(deal) {
+    const results = deal?.associations?.contacts?.results;
+
+    if (!Array.isArray(results)) {
+      return [];
+    }
+
+    return results
+      .map((contact) => String(contact?.id || "").trim())
+      .filter(Boolean);
+  }
+
+  async resolvePrimaryContactIdForDeal(dealId, fallbackContactIds = []) {
+    if (fallbackContactIds.length === 1) {
+      return fallbackContactIds[0];
+    }
+
+    const associations = await requestJson({
+      fetchImpl: this.fetchImpl,
+      logger: this.logger,
+      retryDelaysMs: this.env.retryDelaysMs,
+      url: `${this.env.hubspotApiBaseUrl}/crm/v4/objects/deals/${encodeURIComponent(dealId)}/associations/contacts`,
+      headers: {
+        Authorization: `Bearer ${this.env.hubspotAccessToken}`
+      },
+      operationName: "hubspot.get_deal_contact_associations",
+      context: {
+        dealId
+      }
+    });
+
+    const results = Array.isArray(associations?.results) ? associations.results : [];
+    const primaryAssociation = results.find((association) =>
+      Array.isArray(association?.associationTypes) &&
+      association.associationTypes.some((type) => String(type?.label || "").toLowerCase() === "primary")
+    );
+
+    const resolvedId = primaryAssociation?.toObjectId || results[0]?.toObjectId || fallbackContactIds[0];
+
+    if (!resolvedId) {
+      throw new AppError(400, "HubSpot onboarding deal does not have an associated contact");
+    }
+
+    return String(resolvedId);
   }
 
   resolveContactName(payload) {
